@@ -10,18 +10,23 @@ class BroadCastPlugIn {
         this.id = 'broadcast';
         // default plugin options
         this.options = {
-            master: true, 
-            client: true,
             socketJs: "https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.2.0/socket.io.js",
-            dispatchDelay: 100,
+            eventDispatchDelay: 100,
+            stateDispatchDelay: 500,
+            remoteStateChangeBlackout: 2000,
         };
 
         this.socket = null;
-        this.lastMsgState = null;
+    
+        // state-change-event message queue
+        this.lastStateChange = 0;
+        this.stateDispatchTimer = null;
+        this.lastSharedState = null;
+        this.lastRemoteStateChange = 0;
 
-        // custom event message queue
-        this.lastDispatch = 0;
-        this.timeoutSet = false;
+        // custom-event message queue
+        this.lastEventDispatch = 0;
+        this.eventDispatchTimer = null;
         this.eventQueue = [];
     }
 
@@ -47,90 +52,100 @@ class BroadCastPlugIn {
 		head.appendChild(script);
     }
 
-    isEquivalent(a, b) {
-        // Create arrays of property names
-        let aProps = Object.getOwnPropertyNames(a);
-        let bProps = Object.getOwnPropertyNames(b);
-    
-        // If number of properties is different,
-        // objects are not equivalent
-        if (aProps.length != bProps.length) {
-            return false;
-        }
-    
-        for (var i = 0; i < aProps.length; i++) {
-            var propName = aProps[i];
-    
-            // If values of same property are not equal,
-            // objects are not equivalent
-            if (a[propName] !== b[propName]) {
-                return false;
-            }
-        }
-    
-        // If we made it this far, objects
-        // are considered equivalent
-        return true;
+    isEquivalent(s1, s2) {
+        return (s1.indexh === s2.indexh && s1.indexv === s2.indexv && s1.indexf === s2.indexf && s1.paused === s2.paused);
     }
 
-	handleStateChange() {
-        if (!this.lastMsgState || !this.isEquivalent(this.deck.getState(), this.lastMsgState)) {
-            let messageData = {
-                secret: this.options.secret,
-                socketId: this.options.socketId,
-                state: this.deck.getState(),
-            };
-            this.lastMsgState = {...this.deck.getState()};
-            this.socket.emit( 'multiplex-statechanged', messageData );
-            // console.log("state change msg posted " + JSON.stringify(messageData.state)); 
-        }
+    dispatchStateChange(state) {
+        let messageData = {
+            secret: this.options.secret,
+            socketId: this.options.socketId,
+            state: state,
+        };
+        this.lastSharedState = {...state};
+        this.socket.emit( 'multihost-statechanged', messageData );
     }
 
-    postEventQueue() {
+    handleStateChange() {
+        let state = this.deck.getState();
+        let now = Date.now();
+
+        // post state change message only if current state is different from the last state shared over the network
+        if (this.lastSharedState && this.isEquivalent(state, this.lastSharedState)) return;
+
+        // if we are within the black-out period of a remotely-initiated state change,
+        // we don't share out state change with others
+        // this is a "hack" to avoid an "echo chamber" effect, 
+        // where simultaneous state changes initiated by two device "ping-pong"s forever
+        let interval = now - this.lastRemoteStateChange;
+        if (interval < this.options.remoteStateChangeBlackout) return;
+
+        // check if stateDispatchDelay ms has passed since the last state change
+        interval = now - this.lastStateChange;
+        if (interval >= this.options.stateDispatchDelay) { 
+            // enough time has passed since last state change, so we want to share our current state;
+            // since we are sharing our latest state, we can clear-out any pending state-sharing message
+            this.dispatchStateChange(state);
+        } else {
+            // state-changes are being triggered too frequently
+            // set a timer to wait for stateDispatchDelay to see if things calm down
+
+            // if there is any pending timer, clear it because we are setting a new one now
+            if (this.stateDispatchTimer)  clearTimeout(this.stateDispatchTimer);
+
+            // set a new timer to share the current state after stateDispatchDelay
+            this.stateDispatchTimer = setTimeout(() => { 
+                this.stateDispatchTimer = null;
+                this.dispatchStateChange(state);
+            }, this.options.stateDispatchDelay);
+        }
+        this.lastStateChange = now;
+    }
+
+    dispatchEventQueue() {
         if (this.eventQueue.length > 0) {
             let events = this.eventQueue;
             this.eventQueue = [];
-            this.socket.emit( 'multiplex-statechanged', {
+            this.socket.emit( 'multihost-statechanged', {
                 secret: this.options.secret,
                 socketId: this.options.socketId,
                 events: events,
             });
-            this.lastDispatch = Date.now();
-            // console.log("custom event msg posted");
+            this.lastEventDispatch = Date.now();
         }
     }
 
     handleCustomEvent(data) {
+        // add the new custom event to the event dispatch queue
         this.eventQueue.push(data.content);
 
-        // queue custom events for dispatchDelay
-        let interval = Date.now() - this.lastDispatch;
-        if (interval >= this.options.dispatchDelay) {
-            this.postEventQueue();
+        // check if eventDispatchDelay ms has passed since the last event dispatch
+        let interval = Date.now() - this.lastEventDispatch;
+        if (interval >= this.options.eventDispatchDelay) {
+            // enough time has passed. dispatch the event queue now
+            this.dispatchEventQueue();
         } else {
-            // multiple custom events within dispatchDelay
-            // debounce the events by setting a timeout event
-            if (!this.timeoutSet) {
-                this.timeoutSet = true;
-                setTimeout(() => { 
-                    this.timeoutSet = false;
-                    this.postEventQueue(); 
-                }, this.options.dispatchDelay - interval);
+            // too many custom events are being triggered in a short time
+            // set a timer to dispatch them in batches every eventDispatchDelay ms
+            if (!this.eventDispatchTimer) {
+                this.eventDispatchTimer = setTimeout(() => { 
+                    this.eventDispatchTimer = null;
+                    this.dispatchEventQueue(); 
+                }, this.options.eventDispatchDelay - interval);
             }
         }
     }
 
     handleReceivedMessage(data) {
-        // ignore data from sockets that aren't ours 
+        // ignore data that aren't ours 
         if (data.socketId !== this.options.socketId) return;
 
         if (data.state) {
-            // console.log("state change msg received");
-            this.lastMsgState = {...data.state};
-            this.deck.setState(this.lastMsgState);
+            this.lastSharedState = {...data.state};
+            this.lastRemoteStateChange = Date.now();
+            this.deck.setState(data.state);
         }
         if (data.events) {
-            // console.log("custom event msg received" + JSON.stringify(data.events));
             for (let content of data.events) {
                 // forward custom events to other plugins
                 let event = new CustomEvent('received');
@@ -141,7 +156,6 @@ class BroadCastPlugIn {
     }
 
     setupMaster() {
-        // console.log("Setting up as a master for socketID " + this.options.socketId);
         // post once the page is loaded, so the client follows also on "open URL".
         window.addEventListener( 'load', () => { this.handleStateChange(); } );
 
@@ -149,39 +163,51 @@ class BroadCastPlugIn {
         this.deck.on( 'slidechanged', () => { this.handleStateChange(); } );
         this.deck.on( 'fragmentshown', () => { this.handleStateChange(); } );
         this.deck.on( 'fragmenthidden', () => { this.handleStateChange(); } );
-        this.deck.on( 'overviewhidden', () => { this.handleStateChange(); } );
-        this.deck.on( 'overviewshown', () => { this.handleStateChange(); } );
         this.deck.on( 'paused', () => { this.handleStateChange(); } );
         this.deck.on( 'resumed', () => { this.handleStateChange(); } );
+
+        // Monitor custom events by plugins
         document.addEventListener( 'send', (event) => { this.handleCustomEvent(event); } );
     }
 
     setupClient() {
-        // console.log("Setting up as a client for socketID " + this.options.socketId);
         this.socket.on(this.options.socketId, (data) => { this.handleReceivedMessage(data); });
     }
 
     init(reveal) {
         // save reveal to deck
         this.deck = reveal;
+        this.setupFinished = false;
 
         // get user-provided configuration options
         if (reveal.getConfig()[this.id]) {
             Object.assign(this.options, reveal.getConfig()[this.id]); 
         }
 
+        // if no socketId is set, we cannot use this plugin
+        if (this.options.socketId === undefined) return;
+
         this.loadJavaScript(this.options.socketJs, () => {
-            this.socket = io.connect(this.options.socketUrl);
+            this.socket = io(this.options.socketUrl);
+            this.socket.on('connect', () => {
+                // make sure we don't run initialization code multiple times
+                // without this check, whenever the connection is reestablished
+                // due to interruption, it will run again, causing multiple client-server connection
+                // and duplicate messages
+                if (this.setupFinished) return;
 
-            // setup event broadcaster if master is true
-            if (this.options.master && !window.location.search.match(/receiver/gi)) {
-                this.setupMaster();
-            }
+                // if secret is set, set up master broadcaster
+                if (this.options.secret) {
+                    this.setupMaster();
+                }
 
-            // setup event listener if client is true
-            if (this.options.client) {
-                this.setupClient();
-            }
+                // setup event listener if client is true
+                if (this.options.socketId) {
+                    this.setupClient();
+                }
+
+                this.setupFinished = true;
+            });
         });
     }
 };
